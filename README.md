@@ -1,31 +1,38 @@
-# DOOM STEPMOTHER (Vite + React)
+# DOOM STEPMOTHER (Vite + React + Electron)
 
-## Run locally
+## Install
 
 ```bash
 npm install
+```
+
+## Run as Electron app (recommended)
+
+```bash
+npm run electron:dev
+```
+
+This starts Vite and then launches Electron once the dev server is available.
+
+## Run web-only dev mode
+
+```bash
 npm run dev
 ```
 
-Open the URL printed by Vite (usually `http://localhost:5173`).
+## Run Electron from production build
 
-> Do **not** open `index.html` directly with `file://...`.
-> This app depends on Vite module processing for JSX and package imports.
+```bash
+npm run electron:build
+```
 
-## Production build
+This builds the frontend into `dist/` and then opens that build in Electron.
+
+## Existing web deployment flow
 
 ```bash
 npm run build
-```
-
-This generates static assets in `dist/`.
-
-## Preview production build
-
-```bash
 npm run preview
 ```
 
-## Deploy
-
-Deploy the generated `dist/` folder to any static host (Netlify, Vercel static output, S3+CloudFront, GitHub Pages, etc).
+Deploy the generated `dist/` folder to any static host if you still want a browser-hosted version.
