@@ -228,7 +228,7 @@ const WoodCheek = ({side}) => (<div style={{width:24,minHeight:"100%",background
 
 // ═══ MAIN ═══
 export default function DOOMStepMother() {
-  const audioRef = useRef(null); const seqRef = useRef(null);
+  const audioRef = useRef(null); const arpEventRef = useRef(null); const seqEventRef = useRef(null);
   const midiRef = useRef({access:null,input:null,clockCount:0,clockTimes:[]});
   const [started,setStarted] = useState(false);
   const [activeNotes,setActiveNotes] = useState(new Set());
@@ -252,6 +252,11 @@ export default function DOOMStepMother() {
   const [seqOn,setSeqOn]=useState(false); const [seqSteps,setSeqSteps]=useState(Array(16).fill({note:60,active:true}));
   const [seqLength]=useState(16); const [seqCurrentStep,setSeqCurrentStep]=useState(-1); const [seqTempo,setSeqTempo]=useState(120);
   const [keyboardOctave,setKeyboardOctave]=useState(3);
+  const heldNotesRef = useRef([]);
+  const arpReleaseIdsRef = useRef(new Set());
+  const seqReleaseIdsRef = useRef(new Set());
+  const noteResetIdsRef = useRef(new Set());
+  const legatoMode = true;
 
   const paramSetters = useRef({});
   paramSetters.current = { lfoDepth:setLfoDepth,masterVol:setMasterVol,filterCutoff:setFilterCutoff,filterRes:setFilterRes,attack:setAttack,decay:setDecay,sustain:setSustain,release:setRelease,lfoRate:setLfoRate,reverbMix:setReverbMix,glide:setGlide,hpfCutoff:setHpfCutoff,filterEnvAmt:setFilterEnvAmt,osc1Level:setOsc1Level,osc2Level:setOsc2Level,noiseLevel:setNoiseLevel,osc2Detune:setOsc2Detune,reverbDecay:setReverbDecay };
@@ -297,23 +302,54 @@ export default function DOOMStepMother() {
     const reverb=new Tone.Reverb({decay:2.5,wet:0.15});await reverb.generate();
     const master=new Tone.Gain(0.7);
     mixer.connect(hpf);hpf.connect(lpf);lpf.connect(env);env.connect(reverb);reverb.connect(master);master.toDestination();
-    audioRef.current={osc1,osc2,noise,osc1Gain,osc2Gain,noiseGain,mixer,hpf,lpf,env,filterEnv,lfo,lfoGain,reverb,master,currentNote:null,arpInterval:null,arpNotes:[],pitchBendSemitones:0};
+    Tone.Transport.bpm.value=seqTempo;Tone.Transport.start();
+    audioRef.current={osc1,osc2,noise,osc1Gain,osc2Gain,noiseGain,mixer,hpf,lpf,env,filterEnv,lfo,lfoGain,reverb,master,currentNote:null,currentGateId:0,nextGateId:1,arpNotes:[],pitchBendSemitones:0};
     setStarted(true);
   };
 
-  const playNote = useCallback((midi,velocity=1)=>{
-    if(!audioRef.current)return;const a=audioRef.current;const bo=a.pitchBendSemitones||0;const freq=midiToFreq(midi+bo);const vs=0.3+velocity*0.7;
-    if(glide>0&&a.currentNote!==null){a.osc1.frequency.rampTo(freq*Math.pow(2,osc1Octave),glide);a.osc2.frequency.rampTo(freq*Math.pow(2,osc2Octave),glide);}
-    else{a.osc1.frequency.setValueAtTime(freq*Math.pow(2,osc1Octave),Tone.now());a.osc2.frequency.setValueAtTime(freq*Math.pow(2,osc2Octave),Tone.now());}
-    a.osc1Gain.gain.setValueAtTime(osc1Level*vs,Tone.now());a.osc2Gain.gain.setValueAtTime(osc2Level*vs,Tone.now());a.noiseGain.gain.setValueAtTime(noiseLevel*vs,Tone.now());
-    if(a.currentNote===null){a.env.triggerAttack(Tone.now());a.filterEnv.triggerAttack(Tone.now());}a.currentNote=midi;
+  const clearScheduledReleaseIds = useCallback((idsRef)=>{
+    idsRef.current.forEach(id=>Tone.Transport.clear(id));
+    idsRef.current.clear();
+  },[]);
+
+  const registerHeldNote = useCallback((midi)=>{
+    heldNotesRef.current = [...heldNotesRef.current.filter(n=>n!==midi),midi];
+  },[]);
+
+  const unregisterHeldNote = useCallback((midi)=>{
+    heldNotesRef.current = heldNotesRef.current.filter(n=>n!==midi);
+    return heldNotesRef.current;
+  },[]);
+
+  const playNote = useCallback((midi,velocity=1,time=Tone.now())=>{
+    if(!audioRef.current)return null;const a=audioRef.current;const bo=a.pitchBendSemitones||0;const freq=midiToFreq(midi+bo);const vs=0.3+velocity*0.7;
+    const gateId=a.nextGateId++;
+    a.currentGateId=gateId;
+    if(glide>0&&a.currentNote!==null){a.osc1.frequency.setValueAtTime(a.osc1.frequency.value,time);a.osc2.frequency.setValueAtTime(a.osc2.frequency.value,time);a.osc1.frequency.linearRampToValueAtTime(freq*Math.pow(2,osc1Octave),time+glide);a.osc2.frequency.linearRampToValueAtTime(freq*Math.pow(2,osc2Octave),time+glide);}
+    else{a.osc1.frequency.setValueAtTime(freq*Math.pow(2,osc1Octave),time);a.osc2.frequency.setValueAtTime(freq*Math.pow(2,osc2Octave),time);}
+    a.osc1Gain.gain.setValueAtTime(osc1Level*vs,time);a.osc2Gain.gain.setValueAtTime(osc2Level*vs,time);a.noiseGain.gain.setValueAtTime(noiseLevel*vs,time);
+    const isLegato = legatoMode && a.currentNote!==null;
+    if(!isLegato){a.env.triggerAttack(time);a.filterEnv.triggerAttack(time);}
+    a.currentNote=midi;
+    return gateId;
   },[osc1Octave,osc2Octave,osc1Level,osc2Level,noiseLevel,glide]);
 
-  const releaseNote = useCallback((midi)=>{
+  const releaseNote = useCallback((midi,time=Tone.now(),gateId=null)=>{
     if(!audioRef.current)return;const a=audioRef.current;
-    if(a.currentNote===midi){a.env.triggerRelease(Tone.now());a.filterEnv.triggerRelease(Tone.now());
-    setTimeout(()=>{if(a.currentNote===midi){a.osc1Gain.gain.setValueAtTime(0,Tone.now());a.osc2Gain.gain.setValueAtTime(0,Tone.now());a.noiseGain.gain.setValueAtTime(0,Tone.now());a.currentNote=null;}},(release+0.1)*1000);}
-  },[release]);
+    if(gateId!==null&&gateId!==a.currentGateId)return;
+    if(a.currentNote!==midi)return;
+    const held = heldNotesRef.current;
+    if(held.length>0){
+      const nextNote = held[held.length-1];
+      playNote(nextNote,1,time);
+      return;
+    }
+    a.env.triggerRelease(time);a.filterEnv.triggerRelease(time);
+    const clearTime=time+release+0.1;
+    a.osc1Gain.gain.setValueAtTime(0,clearTime);a.osc2Gain.gain.setValueAtTime(0,clearTime);a.noiseGain.gain.setValueAtTime(0,clearTime);
+    const resetGateId=a.currentGateId;const resetId = Tone.Transport.scheduleOnce(()=>{if(audioRef.current&&audioRef.current.currentNote===midi&&audioRef.current.currentGateId===resetGateId)audioRef.current.currentNote=null;noteResetIdsRef.current.delete(resetId);},clearTime);
+    noteResetIdsRef.current.add(resetId);
+  },[release,playNote]);
 
   const handlePitchBend = useCallback((bv)=>{if(!audioRef.current)return;const a=audioRef.current;const s=bv*2;a.pitchBendSemitones=s;setPitchBend(bv);if(a.currentNote!==null){const f=midiToFreq(a.currentNote+s);a.osc1.frequency.rampTo(f*Math.pow(2,osc1Octave),0.02);a.osc2.frequency.rampTo(f*Math.pow(2,osc2Octave),0.02);}},[osc1Octave,osc2Octave]);
 
@@ -326,31 +362,35 @@ export default function DOOMStepMother() {
   const handleMidiClock = useCallback(()=>{if(!midiClockSync)return;const m=midiRef.current;m.clockCount++;const now=performance.now();m.clockTimes.push(now);if(m.clockTimes.length>24)m.clockTimes.shift();if(m.clockTimes.length>=24){const el=m.clockTimes[m.clockTimes.length-1]-m.clockTimes[0];const bpm=(60000/el)*(m.clockTimes.length-1)/24;if(bpm>20&&bpm<300)setSeqTempo(Math.round(bpm));}},[midiClockSync]);
 
   // MIDI init
-  useEffect(()=>{const init=async()=>{try{const ma=await navigator.requestMIDIAccess({sysex:false});midiRef.current.access=ma;const upd=()=>{const ins=[];ma.inputs.forEach(i=>ins.push({id:i.id,name:i.name||`Input ${i.id}`,manufacturer:i.manufacturer||""}));setMidiDevices(ins);};upd();ma.onstatechange=upd;}catch(e){console.log("No MIDI:",e);}};init();},[]);
+  useEffect(()=>{let ma=null;const init=async()=>{try{ma=await navigator.requestMIDIAccess({sysex:false});midiRef.current.access=ma;const upd=()=>{const ins=[];ma.inputs.forEach(i=>ins.push({id:i.id,name:i.name||`Input ${i.id}`,manufacturer:i.manufacturer||""}));setMidiDevices(ins);};upd();ma.onstatechange=upd;}catch(e){console.log("No MIDI:",e);}};init();return()=>{if(midiRef.current.input){midiRef.current.input.onmidimessage=null;midiRef.current.input=null;}if(ma)ma.onstatechange=null;};},[]);
 
   const handleMidiMessage = useCallback((e)=>{
     const[status,d1,d2]=e.data;const cmd=status&0xf0;const ch=status&0x0f;
     setMidiActivity(Date.now());setTimeout(()=>setMidiActivity(null),100);
-    if(cmd===0x90&&d2>0){setLastMidiMsg(`ON:${midiToNote(d1)} v${d2}`);if(arpOn&&audioRef.current)audioRef.current.arpNotes=[...(audioRef.current.arpNotes||[]),d1];playNote(d1,d2/127);setActiveNotes(p=>new Set([...p,d1]));}
-    else if(cmd===0x80||(cmd===0x90&&d2===0)){setLastMidiMsg(`OFF:${midiToNote(d1)}`);if(arpOn&&audioRef.current){audioRef.current.arpNotes=(audioRef.current.arpNotes||[]).filter(n=>n!==d1);if(audioRef.current.arpNotes.length===0)releaseNote(d1);}else releaseNote(d1);setActiveNotes(p=>{const n=new Set(p);n.delete(d1);return n;});}
+    if(cmd===0x90&&d2>0){setLastMidiMsg(`ON:${midiToNote(d1)} v${d2}`);registerHeldNote(d1);if(arpOn&&audioRef.current)audioRef.current.arpNotes=[...new Set([...(audioRef.current.arpNotes||[]),d1])];playNote(d1,d2/127);setActiveNotes(p=>new Set([...p,d1]));}
+    else if(cmd===0x80||(cmd===0x90&&d2===0)){setLastMidiMsg(`OFF:${midiToNote(d1)}`);unregisterHeldNote(d1);if(arpOn&&audioRef.current){audioRef.current.arpNotes=(audioRef.current.arpNotes||[]).filter(n=>n!==d1);if(audioRef.current.arpNotes.length===0)releaseNote(d1);}else releaseNote(d1);setActiveNotes(p=>{const n=new Set(p);n.delete(d1);return n;});}
     else if(cmd===0xb0){setLastMidiMsg(`CC${d1}:${d2}`);handleCC(d1,d2);}
     else if(cmd===0xe0){const bv=((d2<<7)|d1)/8192-1;setLastMidiMsg(`PB:${bv.toFixed(2)}`);handlePitchBend(bv);}
     else if(status===0xf8)handleMidiClock();
     else if(status===0xfa&&midiClockSync){setSeqOn(true);midiRef.current.clockCount=0;midiRef.current.clockTimes=[];}
     else if(status===0xfc&&midiClockSync)setSeqOn(false);
-  },[playNote,releaseNote,handleCC,handlePitchBend,handleMidiClock,arpOn,midiClockSync]);
+  },[playNote,releaseNote,handleCC,handlePitchBend,handleMidiClock,arpOn,midiClockSync,registerHeldNote,unregisterHeldNote]);
 
   useEffect(()=>{if(!midiRef.current.access||!midiDeviceId)return;if(midiRef.current.input){midiRef.current.input.onmidimessage=null;midiRef.current.input=null;}const inp=midiRef.current.access.inputs.get(midiDeviceId);if(inp){inp.onmidimessage=handleMidiMessage;midiRef.current.input=inp;setMidiConnected(true);}else setMidiConnected(false);},[midiDeviceId,handleMidiMessage]);
+
+  useEffect(()=>{if(!started)return;Tone.Transport.bpm.rampTo(seqTempo,0.05);},[seqTempo,started]);
 
   useEffect(()=>{if(!audioRef.current)return;const a=audioRef.current;a.osc1.type=osc1Wave;a.osc2.type=osc2Wave;a.osc2.detune.value=osc2Detune;a.lpf.frequency.value=filterCutoff;a.lpf.Q.value=filterRes;a.hpf.frequency.value=hpfCutoff;a.env.attack=attack;a.env.decay=decay;a.env.sustain=sustain;a.env.release=release;a.filterEnv.attack=attack;a.filterEnv.decay=decay;a.filterEnv.sustain=sustain*0.6;a.filterEnv.release=release;a.filterEnv.octaves=filterEnvAmt*8;a.lfo.frequency.value=lfoRate;a.lfo.type=lfoWave;a.reverb.wet.value=reverbMix;a.master.gain.value=masterVol;},[osc1Wave,osc2Wave,osc2Detune,filterCutoff,filterRes,hpfCutoff,attack,decay,sustain,release,filterEnvAmt,lfoRate,lfoWave,reverbMix,masterVol]);
 
   useEffect(()=>{if(!audioRef.current)return;const a=audioRef.current;a.lfoGain.disconnect();a.lfoGain.gain.value=lfoDepth;if(lfoTarget==="filter"){a.lfo.min=-lfoDepth*2000;a.lfo.max=lfoDepth*2000;a.lfoGain.connect(a.lpf.frequency);}else if(lfoTarget==="pitch"){a.lfo.min=-lfoDepth*100;a.lfo.max=lfoDepth*100;a.lfoGain.connect(a.osc1.detune);a.lfoGain.connect(a.osc2.detune);}else if(lfoTarget==="amp"){a.lfo.min=1-lfoDepth;a.lfo.max=1;a.lfoGain.connect(a.master.gain);}},[lfoTarget,lfoDepth]);
 
-  useEffect(()=>{if(!audioRef.current)return;const a=audioRef.current;if(a.arpInterval){clearInterval(a.arpInterval);a.arpInterval=null;}if(arpOn&&a.arpNotes.length>0){let idx=0;const interval=60000/(seqTempo*(arpRate/4));let notes=[...a.arpNotes].sort((x,y)=>x-y);let expanded=[];for(let o=0;o<arpOctaves;o++)expanded=expanded.concat(notes.map(n=>n+o*12));if(arpMode==="down")expanded.reverse();else if(arpMode==="updown")expanded=[...expanded,...[...expanded].reverse().slice(1,-1)];a.arpInterval=setInterval(()=>{const note=arpMode==="random"?expanded[Math.floor(Math.random()*expanded.length)]:expanded[idx%expanded.length];playNote(note);setTimeout(()=>{if(audioRef.current)releaseNote(note);},interval*0.7);idx++;},interval);}return()=>{if(a.arpInterval)clearInterval(a.arpInterval);};},[arpOn,arpMode,arpRate,arpOctaves,seqTempo,playNote,releaseNote]);
+  useEffect(()=>{if(arpEventRef.current!==null){Tone.Transport.clear(arpEventRef.current);arpEventRef.current=null;}clearScheduledReleaseIds(arpReleaseIdsRef);if(!audioRef.current||!arpOn||audioRef.current.arpNotes.length===0)return;let idx=0;const intervalTicks=Math.max(1,Math.round((4/arpRate)*Tone.Transport.PPQ));const intervalSeconds=(60/seqTempo)*(4/arpRate);arpEventRef.current=Tone.Transport.scheduleRepeat((time)=>{const a=audioRef.current;if(!a||a.arpNotes.length===0)return;let notes=[...new Set(a.arpNotes)].sort((x,y)=>x-y);let expanded=[];for(let o=0;o<arpOctaves;o++)expanded=expanded.concat(notes.map(n=>n+o*12));if(expanded.length===0)return;if(arpMode==="down")expanded.reverse();else if(arpMode==="updown")expanded=[...expanded,...[...expanded].reverse().slice(1,-1)];const note=arpMode==="random"?expanded[Math.floor(Math.random()*expanded.length)]:expanded[idx%expanded.length];const gateId=playNote(note,1,time);const offId=Tone.Transport.scheduleOnce((offTime)=>{releaseNote(note,offTime,gateId);arpReleaseIdsRef.current.delete(offId);},time+intervalSeconds*0.7);arpReleaseIdsRef.current.add(offId);idx++;},`${intervalTicks}i`);return()=>{if(arpEventRef.current!==null){Tone.Transport.clear(arpEventRef.current);arpEventRef.current=null;}clearScheduledReleaseIds(arpReleaseIdsRef);};},[arpOn,arpMode,arpRate,arpOctaves,seqTempo,playNote,releaseNote,clearScheduledReleaseIds]);
 
-  useEffect(()=>{if(seqRef.current){clearInterval(seqRef.current);seqRef.current=null;}if(seqOn&&audioRef.current){let step=0;const interval=60000/seqTempo/4;seqRef.current=setInterval(()=>{const s=seqSteps[step%seqLength];setSeqCurrentStep(step%seqLength);if(s.active){playNote(s.note);setTimeout(()=>{if(audioRef.current)releaseNote(s.note);},interval*0.7);}step++;},interval);}else setSeqCurrentStep(-1);return()=>{if(seqRef.current)clearInterval(seqRef.current);};},[seqOn,seqSteps,seqLength,seqTempo,playNote,releaseNote]);
+  useEffect(()=>{if(seqEventRef.current!==null){Tone.Transport.clear(seqEventRef.current);seqEventRef.current=null;}clearScheduledReleaseIds(seqReleaseIdsRef);if(!seqOn||!audioRef.current){setSeqCurrentStep(-1);return;}let step=0;const intervalSeconds=(60/seqTempo)/4;seqEventRef.current=Tone.Transport.scheduleRepeat((time)=>{const stepIndex=step%seqLength;const s=seqSteps[stepIndex];setSeqCurrentStep(stepIndex);if(s&&s.active){const gateId=playNote(s.note,1,time);const offId=Tone.Transport.scheduleOnce((offTime)=>{releaseNote(s.note,offTime,gateId);seqReleaseIdsRef.current.delete(offId);},time+intervalSeconds*0.7);seqReleaseIdsRef.current.add(offId);}step++;},"16n");return()=>{if(seqEventRef.current!==null){Tone.Transport.clear(seqEventRef.current);seqEventRef.current=null;}clearScheduledReleaseIds(seqReleaseIdsRef);};},[seqOn,seqSteps,seqLength,seqTempo,playNote,releaseNote,clearScheduledReleaseIds]);
 
-  useEffect(()=>{const keyMap={a:0,w:1,s:2,e:3,d:4,f:5,t:6,g:7,y:8,h:9,u:10,j:11,k:12,o:13,l:14,p:15,";":16};const pressed=new Set();const onDown=(e)=>{if(e.repeat||e.target.tagName==="SELECT"||e.target.tagName==="INPUT")return;const k=e.key.toLowerCase();if(k==="z"){setKeyboardOctave(o=>Math.max(0,o-1));return;}if(k==="x"){setKeyboardOctave(o=>Math.min(7,o+1));return;}if(keyMap[k]!==undefined&&!pressed.has(k)){pressed.add(k);const midi=(keyboardOctave+1)*12+keyMap[k];if(arpOn&&audioRef.current)audioRef.current.arpNotes=[...audioRef.current.arpNotes,midi];playNote(midi);setActiveNotes(p=>new Set([...p,midi]));}};const onUp=(e)=>{const k=e.key.toLowerCase();if(keyMap[k]!==undefined){pressed.delete(k);const midi=(keyboardOctave+1)*12+keyMap[k];if(arpOn&&audioRef.current){audioRef.current.arpNotes=audioRef.current.arpNotes.filter(n=>n!==midi);if(audioRef.current.arpNotes.length===0)releaseNote(midi);}else releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}};window.addEventListener("keydown",onDown);window.addEventListener("keyup",onUp);return()=>{window.removeEventListener("keydown",onDown);window.removeEventListener("keyup",onUp);};},[keyboardOctave,playNote,releaseNote,arpOn]);
+  useEffect(()=>{const keyMap={a:0,w:1,s:2,e:3,d:4,f:5,t:6,g:7,y:8,h:9,u:10,j:11,k:12,o:13,l:14,p:15,";":16};const pressed=new Set();const onDown=(e)=>{if(e.repeat||e.target.tagName==="SELECT"||e.target.tagName==="INPUT")return;const k=e.key.toLowerCase();if(k==="z"){setKeyboardOctave(o=>Math.max(0,o-1));return;}if(k==="x"){setKeyboardOctave(o=>Math.min(7,o+1));return;}if(keyMap[k]!==undefined&&!pressed.has(k)){pressed.add(k);const midi=(keyboardOctave+1)*12+keyMap[k];registerHeldNote(midi);if(arpOn&&audioRef.current)audioRef.current.arpNotes=[...new Set([...audioRef.current.arpNotes,midi])];playNote(midi);setActiveNotes(p=>new Set([...p,midi]));}};const onUp=(e)=>{const k=e.key.toLowerCase();if(keyMap[k]!==undefined){pressed.delete(k);const midi=(keyboardOctave+1)*12+keyMap[k];unregisterHeldNote(midi);if(arpOn&&audioRef.current){audioRef.current.arpNotes=audioRef.current.arpNotes.filter(n=>n!==midi);if(audioRef.current.arpNotes.length===0)releaseNote(midi);}else releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}};window.addEventListener("keydown",onDown);window.addEventListener("keyup",onUp);return()=>{window.removeEventListener("keydown",onDown);window.removeEventListener("keyup",onUp);};},[keyboardOctave,playNote,releaseNote,arpOn,registerHeldNote,unregisterHeldNote]);
+
+  useEffect(()=>()=>{if(seqEventRef.current!==null){Tone.Transport.clear(seqEventRef.current);seqEventRef.current=null;}if(arpEventRef.current!==null){Tone.Transport.clear(arpEventRef.current);arpEventRef.current=null;}clearScheduledReleaseIds(seqReleaseIdsRef);clearScheduledReleaseIds(arpReleaseIdsRef);clearScheduledReleaseIds(noteResetIdsRef);heldNotesRef.current=[];Tone.Transport.stop();Tone.Transport.cancel(0);if(midiRef.current.input){midiRef.current.input.onmidimessage=null;midiRef.current.input=null;}const a=audioRef.current;if(a){[a.osc1,a.osc2,a.noise,a.osc1Gain,a.osc2Gain,a.noiseGain,a.mixer,a.hpf,a.lpf,a.env,a.filterEnv,a.lfo,a.lfoGain,a.reverb,a.master].forEach(n=>{if(n&&typeof n.dispose==="function")n.dispose();});audioRef.current=null;}},[clearScheduledReleaseIds]);
 
   const toggleStep=(i)=>{const ns=[...seqSteps];ns[i]={...ns[i],active:!ns[i].active};setSeqSteps(ns);};
   const changeStepNote=(i,d)=>{const ns=[...seqSteps];ns[i]={...ns[i],note:Math.max(24,Math.min(96,ns[i].note+d))};setSeqSteps(ns);};
@@ -579,9 +619,9 @@ export default function DOOMStepMother() {
             </div>
             <div style={{flex:1,position:"relative",height:110}}>
               <div style={{display:"flex",height:"100%"}}>
-                {Array(19).fill(0).map((_,i)=>{const wn=[0,2,4,5,7,9,11];const oo=Math.floor(i/7);const nn=wn[i%7];const midi=(keyboardOctave+1)*12+oo*12+nn;const act=activeNotes.has(midi);return(<div key={`w${i}`} onMouseDown={e=>{e.preventDefault();playNote(midi);setActiveNotes(p=>new Set([...p,midi]));}} onMouseUp={()=>{releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}} onMouseLeave={()=>{if(activeNotes.has(midi)){releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}}} style={{flex:"1 1 0",height:"100%",minWidth:0,borderRadius:"0 0 4px 4px",cursor:"pointer",zIndex:1,marginRight:-0.5,background:act?"linear-gradient(180deg,#e0d8c8,#ff8844 85%,#ff6622)":"linear-gradient(180deg,#faf6ee,#f0ece0 15%,#eae4d8 75%,#e0d8c8)",border:"1px solid #b0a898",boxShadow:act?"0 0 15px #ff884433":"inset 0 -6px 12px rgba(0,0,0,0.03),0 2px 3px rgba(0,0,0,0.08)",transition:"background 0.04s"}} />);})}
+                {Array(19).fill(0).map((_,i)=>{const wn=[0,2,4,5,7,9,11];const oo=Math.floor(i/7);const nn=wn[i%7];const midi=(keyboardOctave+1)*12+oo*12+nn;const act=activeNotes.has(midi);return(<div key={`w${i}`} onMouseDown={e=>{e.preventDefault();registerHeldNote(midi);playNote(midi);setActiveNotes(p=>new Set([...p,midi]));}} onMouseUp={()=>{unregisterHeldNote(midi);releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}} onMouseLeave={()=>{if(activeNotes.has(midi)){unregisterHeldNote(midi);releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}}} style={{flex:"1 1 0",height:"100%",minWidth:0,borderRadius:"0 0 4px 4px",cursor:"pointer",zIndex:1,marginRight:-0.5,background:act?"linear-gradient(180deg,#e0d8c8,#ff8844 85%,#ff6622)":"linear-gradient(180deg,#faf6ee,#f0ece0 15%,#eae4d8 75%,#e0d8c8)",border:"1px solid #b0a898",boxShadow:act?"0 0 15px #ff884433":"inset 0 -6px 12px rgba(0,0,0,0.03),0 2px 3px rgba(0,0,0,0.08)",transition:"background 0.04s"}} />);})}
               </div>
-              {Array(15).fill(0).map((_,i)=>{const bp=[0,1,3,4,5];const bn=[1,3,6,8,10];const oo=Math.floor(i/5);if(oo>=3)return null;const pp=bp[i%5];const nn=bn[i%5];const midi=(keyboardOctave+1)*12+oo*12+nn;const act=activeNotes.has(midi);const kw=100/19;const xp=(oo*7+pp+0.55)*kw;return(<div key={`b${i}`} onMouseDown={e=>{e.preventDefault();playNote(midi);setActiveNotes(p=>new Set([...p,midi]));}} onMouseUp={()=>{releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}} onMouseLeave={()=>{if(activeNotes.has(midi)){releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}}} style={{position:"absolute",top:0,left:`${xp}%`,width:`${kw*0.62}%`,height:"58%",borderRadius:"0 0 3px 3px",cursor:"pointer",zIndex:2,background:act?"linear-gradient(180deg,#333,#ff4400 90%)":"linear-gradient(180deg,#2a2a28,#1a1a18 35%,#111 85%,#0a0a0a)",border:"1px solid #000",boxShadow:act?"0 0 12px #ff440044":"0 3px 8px rgba(0,0,0,0.6),inset 0 -3px 5px rgba(0,0,0,0.3)",transition:"background 0.04s"}} />);})}
+              {Array(15).fill(0).map((_,i)=>{const bp=[0,1,3,4,5];const bn=[1,3,6,8,10];const oo=Math.floor(i/5);if(oo>=3)return null;const pp=bp[i%5];const nn=bn[i%5];const midi=(keyboardOctave+1)*12+oo*12+nn;const act=activeNotes.has(midi);const kw=100/19;const xp=(oo*7+pp+0.55)*kw;return(<div key={`b${i}`} onMouseDown={e=>{e.preventDefault();registerHeldNote(midi);playNote(midi);setActiveNotes(p=>new Set([...p,midi]));}} onMouseUp={()=>{unregisterHeldNote(midi);releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}} onMouseLeave={()=>{if(activeNotes.has(midi)){unregisterHeldNote(midi);releaseNote(midi);setActiveNotes(p=>{const n=new Set(p);n.delete(midi);return n;});}}} style={{position:"absolute",top:0,left:`${xp}%`,width:`${kw*0.62}%`,height:"58%",borderRadius:"0 0 3px 3px",cursor:"pointer",zIndex:2,background:act?"linear-gradient(180deg,#333,#ff4400 90%)":"linear-gradient(180deg,#2a2a28,#1a1a18 35%,#111 85%,#0a0a0a)",border:"1px solid #000",boxShadow:act?"0 0 12px #ff440044":"0 3px 8px rgba(0,0,0,0.6),inset 0 -3px 5px rgba(0,0,0,0.3)",transition:"background 0.04s"}} />);})}
             </div>
           </div>
 
